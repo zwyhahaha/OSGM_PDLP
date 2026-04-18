@@ -461,3 +461,102 @@ function update_osgm_preconditioner!(
         osgm_state.z_start_primal, osgm_state.block_endpoint_primal,
         dual_step_size, phi_prod, osgm_stepsize, n)
 end
+
+function osgm_boundary_step!(
+    problem::CuLinearProgrammingProblem,
+    solver_state::CuPdhgSolverState,
+    osgm_state::CuOsgmState,
+    probe_buffer::CuProbeBuffer,
+    last_restart_info::CuRestartInfo,
+    primal_norm_params::Float64,
+    dual_norm_params::Float64,
+    params::PdhgParameters,
+    osgm_stepsize::Float64,
+    buffer_avg::CuBufferAvgState,
+    buffer_kkt::BufferKKTState,
+    buffer_primal_gradient::CuVector{Float64},
+    total_inner_iterations::Int64,
+)
+    step_size     = solver_state.step_size
+    primal_weight = solver_state.primal_weight
+    primal_step_size = step_size / primal_weight
+    dual_step_size   = step_size * primal_weight
+
+    # Step 4-5: compute z_cand in-place into current_primal/dual_solution
+    compute_z_cand!(
+        solver_state.current_primal_solution,
+        osgm_state.z_start_primal,
+        osgm_state.block_endpoint_primal,
+        osgm_state.primal_hyperparam,
+    )
+    compute_z_cand!(
+        solver_state.current_dual_solution,
+        osgm_state.z_start_dual,
+        osgm_state.block_endpoint_dual,
+        osgm_state.dual_hyperparam,
+    )
+
+    # Step 6: probe at z_cand
+    recompute_a_products!(problem, solver_state)
+    run_probe_step!(problem, solver_state, probe_buffer)
+    phi_trial = compute_m_norm(
+        probe_buffer.delta_primal, probe_buffer.delta_dual,
+        probe_buffer.delta_primal_product, primal_step_size, dual_step_size)
+
+    # Step 7: null-step decision
+    if phi_trial <= osgm_state.phi_last
+        # ACCEPT z_cand: current state stays as z_cand
+        phi_next = phi_trial
+    else
+        # REJECT: restore T^m(z^k) and probe there
+        solver_state.current_primal_solution .= osgm_state.block_endpoint_primal
+        solver_state.current_dual_solution   .= osgm_state.block_endpoint_dual
+        recompute_a_products!(problem, solver_state)
+        run_probe_step!(problem, solver_state, probe_buffer)
+        phi_next = compute_m_norm(
+            probe_buffer.delta_primal, probe_buffer.delta_dual,
+            probe_buffer.delta_primal_product, primal_step_size, dual_step_size)
+    end
+
+    # Step 8: restart scheme
+    restart_used = run_restart_scheme(
+        problem,
+        solver_state.solution_weighted_avg,
+        solver_state.current_primal_solution,
+        solver_state.current_dual_solution,
+        last_restart_info,
+        total_inner_iterations,
+        primal_norm_params,
+        dual_norm_params,
+        solver_state.primal_weight,
+        params.verbosity,
+        params.restart_params,
+        solver_state.current_primal_product,
+        solver_state.current_dual_product,
+        buffer_avg,
+        buffer_kkt,
+        buffer_primal_gradient,
+    )
+
+    # Step 9: primal weight update on restart
+    if restart_used != RESTART_CHOICE_NO_RESTART
+        solver_state.primal_weight = compute_new_primal_weight(
+            last_restart_info,
+            solver_state.primal_weight,
+            params.restart_params.primal_weight_update_smoothing,
+            params.verbosity,
+        )
+        solver_state.ratio_step_sizes = 1.0
+    end
+
+    # Step 10: update preconditioner
+    if osgm_stepsize > 0.0
+        update_osgm_preconditioner!(
+            problem, solver_state, osgm_state, probe_buffer, phi_next, osgm_stepsize)
+    end
+
+    # Step 11: carry phi_last forward
+    osgm_state.phi_last = phi_next
+
+    return restart_used
+end
