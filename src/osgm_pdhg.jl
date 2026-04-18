@@ -721,6 +721,10 @@ function optimize(
         osgm_state.block_endpoint_primal .= solver_state.current_primal_solution
         osgm_state.block_endpoint_dual   .= solver_state.current_dual_solution
 
+        # Update primal gradient at block endpoint before restart scheme
+        buffer_primal_gradient .= d_scaled_problem.scaled_qp.objective_vector .-
+                                   solver_state.current_dual_product
+
         # OSGM boundary step (null-step, restart, hypergradient)
         primal_norm_params, dual_norm_params = define_norms(
             primal_size, dual_size, solver_state.step_size, solver_state.primal_weight)
@@ -802,7 +806,7 @@ function optimize(
 
         if print_to_screen_this_iteration(
             termination_reason, total_inner_iters, params.verbosity,
-            osgm_params.osgm_block_size)
+            Int32(osgm_params.osgm_block_size))
             display_iteration_stats(current_iteration_stats, params.verbosity)
         end
 
