@@ -560,3 +560,297 @@ function osgm_boundary_step!(
 
     return restart_used
 end
+
+function optimize(
+    params::PdhgParameters,
+    osgm_params::OsgmPdhgParameters,
+    original_problem::QuadraticProgrammingProblem,
+)
+    validate(original_problem)
+    qp_cache = cached_quadratic_program_info(original_problem)
+    buffer_lp = qp_cpu_to_gpu(original_problem)
+
+    Printf.@printf("Rescaling problem...\n")
+    start_rescaling_time = time()
+    scaled_problem = rescale_problem(
+        params.l_inf_ruiz_iterations,
+        params.l2_norm_rescaling,
+        params.pock_chambolle_alpha,
+        params.verbosity,
+        original_problem,
+    )
+    d_scaled_problem = scaledqp_cpu_to_gpu(scaled_problem)
+    Printf.@printf("Preconditioning Time (seconds): %.2e\n", time() - start_rescaling_time)
+
+    primal_size = length(d_scaled_problem.scaled_qp.variable_lower_bound)
+    dual_size   = length(d_scaled_problem.scaled_qp.right_hand_side)
+    num_eq      = d_scaled_problem.scaled_qp.num_equalities
+    d_problem   = d_scaled_problem.scaled_qp
+
+    # --- Solver state ---
+    solver_state = CuPdhgSolverState(
+        CUDA.zeros(Float64, primal_size),
+        CUDA.zeros(Float64, dual_size),
+        CUDA.zeros(Float64, dual_size),
+        CUDA.zeros(Float64, primal_size),
+        initialize_solution_weighted_average(primal_size, dual_size),
+        0.0,     # step_size (set below)
+        1.0,     # primal_weight
+        false,   # numerical_error
+        0.0,     # cumulative_kkt_passes
+        0,       # total_number_iterations
+        nothing, # required_ratio
+        nothing, # ratio_step_sizes
+    )
+
+    # Always use constant stepsize for OSGM (power method)
+    desired_relative_error = 1e-6
+    maximum_singular_value, num_power_iters = estimate_maximum_singular_value(
+        scaled_problem.scaled_qp.constraint_matrix,
+        probability_of_failure = 0.001,
+        desired_relative_error = desired_relative_error,
+    )
+    solver_state.step_size = (1 - desired_relative_error) / maximum_singular_value
+    solver_state.cumulative_kkt_passes += num_power_iters
+
+    if params.scale_invariant_initial_primal_weight
+        solver_state.primal_weight = select_initial_primal_weight(
+            d_scaled_problem.scaled_qp, 1.0, 1.0, params.primal_importance, params.verbosity)
+    else
+        solver_state.primal_weight = params.primal_importance
+    end
+
+    # --- OSGM state ---
+    osgm_state   = initialize_osgm_state(primal_size, dual_size)
+    probe_buffer = initialize_probe_buffer(primal_size, dual_size)
+
+    # --- Inner step buffer ---
+    inner_buffer = CuBufferState(
+        CUDA.zeros(Float64, primal_size),
+        CUDA.zeros(Float64, dual_size),
+        CUDA.zeros(Float64, dual_size),
+    )
+
+    # --- KKT / logging buffers ---
+    buffer_avg = CuBufferAvgState(
+        CUDA.zeros(Float64, primal_size),
+        CUDA.zeros(Float64, dual_size),
+        CUDA.zeros(Float64, dual_size),
+        CUDA.zeros(Float64, primal_size),
+    )
+
+    buffer_original = BufferOriginalSol(
+        CUDA.zeros(Float64, primal_size),
+        CUDA.zeros(Float64, dual_size),
+        CUDA.zeros(Float64, dual_size),
+        CUDA.zeros(Float64, primal_size),
+    )
+
+    buffer_kkt = BufferKKTState(
+        buffer_original.original_primal_solution,
+        buffer_original.original_dual_solution,
+        buffer_original.original_primal_product,
+        buffer_original.original_primal_gradient,
+        CUDA.zeros(Float64, primal_size),
+        CUDA.zeros(Float64, primal_size),
+        CUDA.zeros(Float64, dual_size),
+        CUDA.zeros(Float64, primal_size),
+        CUDA.zeros(Float64, primal_size),
+        CuDualStats(0.0, CUDA.zeros(Float64, dual_size - num_eq), CUDA.zeros(Float64, primal_size)),
+        0.0,
+    )
+
+    buffer_kkt_infeas = BufferKKTState(
+        buffer_original.original_primal_solution,
+        buffer_original.original_dual_solution,
+        buffer_original.original_primal_product,
+        buffer_original.original_primal_gradient,
+        CUDA.zeros(Float64, primal_size),
+        CUDA.zeros(Float64, primal_size),
+        CUDA.zeros(Float64, dual_size),
+        CUDA.zeros(Float64, primal_size),
+        CUDA.zeros(Float64, primal_size),
+        CuDualStats(0.0, CUDA.zeros(Float64, dual_size - num_eq), CUDA.zeros(Float64, primal_size)),
+        0.0,
+    )
+
+    buffer_primal_gradient = CUDA.zeros(Float64, primal_size)
+    buffer_primal_gradient .= d_scaled_problem.scaled_qp.objective_vector .-
+                              solver_state.current_dual_product
+
+    last_restart_info = create_last_restart_info(
+        d_scaled_problem.scaled_qp,
+        solver_state.current_primal_solution,
+        solver_state.current_dual_solution,
+        solver_state.current_primal_product,
+        buffer_primal_gradient,
+    )
+
+    termination_criteria = params.termination_criteria
+    iteration_limit = termination_criteria.iteration_limit
+    KKT_PASSES_PER_TERMINATION_EVALUATION = 2.0
+
+    iteration_stats = IterationStats[]
+    start_time = time()
+    time_spent_doing_basic_algorithm = 0.0
+    solver_state.numerical_error = false
+    display_iteration_stats_heading(params.verbosity)
+
+    outer_iteration = 0
+
+    while true
+        outer_iteration += 1
+        total_inner_iters = outer_iteration * osgm_params.osgm_block_size
+
+        if total_inner_iters > iteration_limit
+            break
+        end
+
+        # Save z_start
+        osgm_state.z_start_primal .= solver_state.current_primal_solution
+        osgm_state.z_start_dual   .= solver_state.current_dual_solution
+
+        # Run m inner PDHG steps
+        t0 = time()
+        for _ in 1:osgm_params.osgm_block_size
+            solver_state.total_number_iterations += 1
+            take_osgm_inner_step!(d_problem, solver_state, inner_buffer, osgm_state)
+        end
+
+        # Save block endpoint T^m(z^k)
+        osgm_state.block_endpoint_primal .= solver_state.current_primal_solution
+        osgm_state.block_endpoint_dual   .= solver_state.current_dual_solution
+
+        # OSGM boundary step (null-step, restart, hypergradient)
+        primal_norm_params, dual_norm_params = define_norms(
+            primal_size, dual_size, solver_state.step_size, solver_state.primal_weight)
+
+        osgm_boundary_step!(
+            d_problem,
+            solver_state,
+            osgm_state,
+            probe_buffer,
+            last_restart_info,
+            primal_norm_params,
+            dual_norm_params,
+            params,
+            osgm_params.osgm_stepsize,
+            buffer_avg,
+            buffer_kkt,
+            buffer_primal_gradient,
+            total_inner_iters,
+        )
+
+        # Probe steps cost ~2 extra KKT passes
+        solver_state.cumulative_kkt_passes += 2.0
+
+        time_spent_doing_basic_algorithm += time() - t0
+
+        # Termination evaluation
+        solver_state.cumulative_kkt_passes += KKT_PASSES_PER_TERMINATION_EVALUATION
+
+        if solver_state.solution_weighted_avg.sum_primal_solutions_count == 0
+            buffer_avg.avg_primal_solution .= solver_state.current_primal_solution
+            buffer_avg.avg_dual_solution   .= solver_state.current_dual_solution
+            buffer_avg.avg_primal_product  .= solver_state.current_primal_product
+            buffer_avg.avg_primal_gradient .= buffer_primal_gradient
+        else
+            compute_average!(solver_state.solution_weighted_avg, buffer_avg, d_problem)
+        end
+
+        current_iteration_stats = evaluate_unscaled_iteration_stats(
+            d_scaled_problem,
+            qp_cache,
+            params.termination_criteria,
+            params.record_iteration_stats,
+            buffer_avg.avg_primal_solution,
+            buffer_avg.avg_dual_solution,
+            total_inner_iters,
+            time() - start_time,
+            solver_state.cumulative_kkt_passes,
+            termination_criteria.eps_optimal_absolute,
+            termination_criteria.eps_optimal_relative,
+            solver_state.step_size,
+            solver_state.primal_weight,
+            POINT_TYPE_AVERAGE_ITERATE,
+            buffer_avg.avg_primal_product,
+            buffer_avg.avg_primal_gradient,
+            buffer_original,
+            buffer_kkt,
+            buffer_kkt_infeas,
+            buffer_lp,
+        )
+        method_specific_stats = current_iteration_stats.method_specific_stats
+        method_specific_stats["time_spent_doing_basic_algorithm"] = time_spent_doing_basic_algorithm
+
+        termination_reason = check_termination_criteria(
+            termination_criteria, qp_cache, current_iteration_stats)
+
+        if solver_state.numerical_error && termination_reason == false
+            termination_reason = TERMINATION_REASON_NUMERICAL_ERROR
+        end
+
+        if total_inner_iters < 10 && (
+            termination_reason == TERMINATION_REASON_PRIMAL_INFEASIBLE ||
+            termination_reason == TERMINATION_REASON_DUAL_INFEASIBLE)
+            termination_reason = false
+        end
+
+        if params.record_iteration_stats || termination_reason != false
+            push!(iteration_stats, current_iteration_stats)
+        end
+
+        if print_to_screen_this_iteration(
+            termination_reason, total_inner_iters, params.verbosity,
+            osgm_params.osgm_block_size)
+            display_iteration_stats(current_iteration_stats, params.verbosity)
+        end
+
+        if termination_reason != false
+            avg_primal_solution = zeros(primal_size)
+            avg_dual_solution   = zeros(dual_size)
+            gpu_to_cpu!(buffer_avg.avg_primal_solution, buffer_avg.avg_dual_solution,
+                        avg_primal_solution, avg_dual_solution)
+
+            buffer_primal_gradient .= d_scaled_problem.scaled_qp.objective_vector .-
+                                      solver_state.current_dual_product
+
+            pdhg_final_log(
+                scaled_problem.scaled_qp,
+                avg_primal_solution,
+                avg_dual_solution,
+                params.verbosity,
+                total_inner_iters,
+                termination_reason,
+                current_iteration_stats)
+
+            return unscaled_saddle_point_output(
+                scaled_problem,
+                avg_primal_solution,
+                avg_dual_solution,
+                termination_reason,
+                total_inner_iters - 1,
+                iteration_stats)
+        end
+
+        buffer_primal_gradient .= d_scaled_problem.scaled_qp.objective_vector .-
+                                  solver_state.current_dual_product
+    end
+
+    # Iteration limit exceeded
+    avg_primal_solution = zeros(primal_size)
+    avg_dual_solution   = zeros(dual_size)
+    if solver_state.solution_weighted_avg.sum_primal_solutions_count > 0
+        compute_average!(solver_state.solution_weighted_avg, buffer_avg, d_problem)
+    end
+    gpu_to_cpu!(buffer_avg.avg_primal_solution, buffer_avg.avg_dual_solution,
+                avg_primal_solution, avg_dual_solution)
+
+    return unscaled_saddle_point_output(
+        scaled_problem,
+        avg_primal_solution,
+        avg_dual_solution,
+        TERMINATION_REASON_ITERATION_LIMIT,
+        outer_iteration * osgm_params.osgm_block_size,
+        iteration_stats)
+end
