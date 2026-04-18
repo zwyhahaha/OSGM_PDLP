@@ -76,7 +76,7 @@ If no restart occurred in `artificial_restart_threshold` (default 0.36) × total
 ```
 ω_new = exp(s · log(‖Δdual‖/‖Δprimal‖) + (1-s) · log(ω_old))
 ```
-where `s` = `primal_weight_update_smoothing` (default 0.5), and distances are measured since the previous restart point.
+where `s` = `primal_weight_update_smoothing` (default 0.5), and `Δx_restart`, `Δy_restart` are distances since the previous restart point (not single-step changes from PDHG iteration).
 
 Implemented in `compute_new_primal_weight` (`saddle_point_gpu.jl:627`).
 

@@ -10,7 +10,7 @@ The metric `M = diag(ω/τ, 1/(ωτ))` acts block-diagonally on `z = [x; y]`:
 
 In code (`osgm_pdhg.jl#compute_norms`): implemented as weighted dot products using `CUDA.dot`.
 
-The off-diagonal `[[0, Aᵀ],[A, 0]]` term in the full M (from the saddle-point structure) is incorporated via the cuSPARSE products when evaluating `‖r‖_M` on the full residual.
+The diagonal approximation `M ≈ diag(ω/τ, 1/(ωτ))` is used for the preconditioner update. The full operator metric (from the saddle-point structure) includes off-diagonal `[[0, Aᵀ],[A, 0]]` terms, computed via cuSPARSE when evaluating the full residual norm `‖r‖_M`.
 
 ## Hypergradient g^k
 
