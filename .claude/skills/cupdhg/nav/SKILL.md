@@ -42,7 +42,7 @@ description: Use when navigating the cuPDLP.jl codebase — finding which file o
 - `PdhgParameters` — `primal_dual_hybrid_gradient_gpu.jl:9` — hyperparameters: `termination_criteria`, `restart_params`, `step_size_policy_params`, `termination_evaluation_frequency`
 - `AdaptiveStepsizeParams` — `primal_dual_hybrid_gradient_gpu.jl:2` — `reduction_exponent`, `growth_exponent`
 - `ConstantStepsizeParams` — `primal_dual_hybrid_gradient_gpu.jl:7` — singleton, triggers power method
-- `OsgmPdhgParameters` — `osgm_pdhg.jl` — `osgm_stepsize::Float64` (η), `block_size::Int` (m)
+- `PdhgParameters` (OSGM variant) — `osgm_pdhg.jl:9` — extends base params with `learning_rate::Float64`, `online_scaling::Bool`, `online_scaling_frequency::Int64`, `normalize::Bool`
 - `TerminationCriteria` — `termination.jl:9` — tolerances, time/iteration limits
 - `RestartParameters` — `saddle_point_gpu.jl` — `restart_scheme`, `artificial_restart_threshold`, etc.
 
@@ -59,7 +59,7 @@ description: Use when navigating the cuPDLP.jl codebase — finding which file o
 | `OptimalityNorm` | `termination.jl:6` | `L_INF`, `L2` |
 | `TerminationReason` | `solve_log.jl:323` | `OPTIMAL`, `PRIMAL_INFEASIBLE`, `DUAL_INFEASIBLE`, `TIME_LIMIT`, `ITERATION_LIMIT`, `NUMERICAL_ERROR` |
 | `PointType` | `solve_log.jl:39` | `CURRENT_ITERATE`, `AVERAGE_ITERATE`, `OUTPUT_ITERATE` |
-| `RestartChoice` | `solve_log.jl:19` | (restart decision logging) |
+| `RestartChoice` | `solve_log.jl:19` | `RESTART_CHOICE_UNSPECIFIED`, `RESTART_CHOICE_NO_RESTART`, `RESTART_CHOICE_WEIGHTED_AVERAGE_RESET`, `RESTART_CHOICE_RESTART_TO_AVERAGE` |
 
 ## Data Flow
 
