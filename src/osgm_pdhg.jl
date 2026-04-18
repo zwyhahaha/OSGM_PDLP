@@ -53,8 +53,6 @@ function initialize_probe_buffer(primal_size::Int64, dual_size::Int64)
     )
 end
 
-# ── Task 2: Preconditioned inner PDHG kernels ────────────────────────────────
-
 function compute_next_primal_osgm_kernel!(
     objective_vector::CuDeviceVector{Float64},
     variable_lower_bound::CuDeviceVector{Float64},
@@ -196,8 +194,6 @@ function take_osgm_inner_step!(
     update_solution_in_solver_state!(problem, solver_state, buffer_state)
 end
 
-# ── Task 3: M-norm, z_cand, and Probe Step ──────────────────────────────────
-
 function compute_m_norm(
     delta_primal::CuVector{Float64},
     delta_dual::CuVector{Float64},
@@ -289,8 +285,6 @@ function run_probe_step!(
                       probe_buffer.delta_dual_product, 'O',
                       CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
 end
-
-# ── Task 4: Hypergradient kernels and preconditioner OGD update ──────────────
 
 function compute_mx_kernel!(
     hyper_tmp::CuDeviceVector{Float64},
@@ -570,7 +564,9 @@ function optimize(
     qp_cache = cached_quadratic_program_info(original_problem)
     buffer_lp = qp_cpu_to_gpu(original_problem)
 
-    Printf.@printf("Rescaling problem...\n")
+    if params.verbosity >= 1
+        Printf.@printf("Rescaling problem...\n")
+    end
     start_rescaling_time = time()
     scaled_problem = rescale_problem(
         params.l_inf_ruiz_iterations,
