@@ -289,3 +289,175 @@ function run_probe_step!(
                       probe_buffer.delta_dual_product, 'O',
                       CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
 end
+
+# ── Task 4: Hypergradient kernels and preconditioner OGD update ──────────────
+
+function compute_mx_kernel!(
+    hyper_tmp::CuDeviceVector{Float64},
+    delta_primal::CuDeviceVector{Float64},
+    delta_dual_product::CuDeviceVector{Float64},
+    primal_step_size::Float64,
+    n::Int64,
+)
+    tx = threadIdx().x + (blockDim().x * (blockIdx().x - 0x1))
+    if tx <= n
+        @inbounds hyper_tmp[tx] = delta_primal[tx] / primal_step_size + delta_dual_product[tx]
+    end
+    return
+end
+
+function compute_mlam_kernel!(
+    hyper_tmp2::CuDeviceVector{Float64},
+    delta_primal_product::CuDeviceVector{Float64},
+    delta_dual::CuDeviceVector{Float64},
+    dual_step_size::Float64,
+    m::Int64,
+)
+    tx = threadIdx().x + (blockDim().x * (blockIdx().x - 0x1))
+    if tx <= m
+        @inbounds hyper_tmp2[tx] = delta_primal_product[tx] + delta_dual[tx] / dual_step_size
+    end
+    return
+end
+
+function compute_dmrlam_kernel!(
+    dmrlam::CuDeviceVector{Float64},
+    mlam::CuDeviceVector{Float64},
+    current_dual_solution::CuDeviceVector{Float64},
+    m::Int64,
+)
+    tx = threadIdx().x + (blockDim().x * (blockIdx().x - 0x1))
+    if tx <= m
+        @inbounds dmrlam[tx] = current_dual_solution[tx] > 0.0 ? mlam[tx] : 0.0
+    end
+    return
+end
+
+function compute_partial_vlam_kernel!(
+    aux_dual::CuDeviceVector{Float64},
+    mlam::CuDeviceVector{Float64},
+    current_dual_solution::CuDeviceVector{Float64},
+    primal_step_size::Float64,
+    m::Int64,
+)
+    tx = threadIdx().x + (blockDim().x * (blockIdx().x - 0x1))
+    if tx <= m
+        @inbounds begin
+            active = current_dual_solution[tx] > 0.0 ? 1.0 : 0.0
+            aux_dual[tx] = -primal_step_size * aux_dual[tx] + (1.0 - active) * mlam[tx]
+        end
+    end
+    return
+end
+
+function update_dual_hyperparam_kernel!(
+    dual_hyperparam::CuDeviceVector{Float64},
+    partial_vlam::CuDeviceVector{Float64},
+    a_at_dmrlam::CuDeviceVector{Float64},
+    z_start_dual::CuDeviceVector{Float64},
+    block_endpoint_dual::CuDeviceVector{Float64},
+    tau_p_tau_d::Float64,
+    phi_prod::Float64,
+    osgm_stepsize::Float64,
+    m::Int64,
+)
+    tx = threadIdx().x + (blockDim().x * (blockIdx().x - 0x1))
+    if tx <= m
+        @inbounds begin
+            R_dual = z_start_dual[tx] - block_endpoint_dual[tx]
+            vlam = partial_vlam[tx] + 2.0 * tau_p_tau_d * a_at_dmrlam[tx]
+            g = vlam * R_dual
+            dual_hyperparam[tx] = max(0.0, dual_hyperparam[tx] + osgm_stepsize * g / phi_prod)
+        end
+    end
+    return
+end
+
+function update_primal_hyperparam_kernel!(
+    primal_hyperparam::CuDeviceVector{Float64},
+    at_dmrlam::CuDeviceVector{Float64},
+    z_start_primal::CuDeviceVector{Float64},
+    block_endpoint_primal::CuDeviceVector{Float64},
+    dual_step_size::Float64,
+    phi_prod::Float64,
+    osgm_stepsize::Float64,
+    n::Int64,
+)
+    tx = threadIdx().x + (blockDim().x * (blockIdx().x - 0x1))
+    if tx <= n
+        @inbounds begin
+            R_primal = z_start_primal[tx] - block_endpoint_primal[tx]
+            g = dual_step_size * at_dmrlam[tx] * R_primal
+            primal_hyperparam[tx] = max(0.0, primal_hyperparam[tx] + osgm_stepsize * g / phi_prod)
+        end
+    end
+    return
+end
+
+function update_osgm_preconditioner!(
+    problem::CuLinearProgrammingProblem,
+    solver_state::CuPdhgSolverState,
+    osgm_state::CuOsgmState,
+    probe_buffer::CuProbeBuffer,
+    phi_next::Float64,
+    osgm_stepsize::Float64,
+)
+    phi_prod = osgm_state.phi_last * phi_next
+    phi_prod < 1e-30 && return  # guard: skip if degenerate
+
+    primal_step_size = solver_state.step_size / solver_state.primal_weight
+    dual_step_size   = solver_state.step_size * solver_state.primal_weight
+    tau_p_tau_d      = primal_step_size * dual_step_size  # = step_size^2
+
+    n = problem.num_variables
+    m = problem.num_constraints
+    n_blocks = ceil(Int64, n / ThreadPerBlock)
+    m_blocks = ceil(Int64, m / ThreadPerBlock)
+
+    # 1. hyper_tmp = mx = delta_primal/τ_p + delta_dual_product
+    CUDA.@sync @cuda threads=ThreadPerBlock blocks=n_blocks compute_mx_kernel!(
+        probe_buffer.hyper_tmp, probe_buffer.delta_primal, probe_buffer.delta_dual_product,
+        primal_step_size, n)
+
+    # 2. aux_dual = A * mx  (1 SpMV)
+    CUDA.CUSPARSE.mv!('N', 1, problem.constraint_matrix,
+                      probe_buffer.hyper_tmp, 0, probe_buffer.aux_dual, 'O',
+                      CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+
+    # 3. hyper_tmp2 = mlam = delta_primal_product + delta_dual/τ_d
+    CUDA.@sync @cuda threads=ThreadPerBlock blocks=m_blocks compute_mlam_kernel!(
+        probe_buffer.hyper_tmp2, probe_buffer.delta_primal_product, probe_buffer.delta_dual,
+        dual_step_size, m)
+
+    # 4. delta_dual = dmrlam = active_dual ⊙ mlam  (reuse probe_buffer.delta_dual)
+    CUDA.@sync @cuda threads=ThreadPerBlock blocks=m_blocks compute_dmrlam_kernel!(
+        probe_buffer.delta_dual, probe_buffer.hyper_tmp2,
+        solver_state.current_dual_solution, m)
+
+    # 5. hyper_tmp = A^T * dmrlam  (1 SpMV, overwrites mx)
+    CUDA.CUSPARSE.mv!('N', 1, problem.constraint_matrix_t,
+                      probe_buffer.delta_dual, 0, probe_buffer.hyper_tmp, 'O',
+                      CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+
+    # 6. aux_dual = -τ_p * (A mx) + (1-active) * mlam  (partial vlam)
+    CUDA.@sync @cuda threads=ThreadPerBlock blocks=m_blocks compute_partial_vlam_kernel!(
+        probe_buffer.aux_dual, probe_buffer.hyper_tmp2,
+        solver_state.current_dual_solution, primal_step_size, m)
+
+    # 7. hyper_tmp2 = A * (A^T dmrlam)  (1 SpMV, overwrites mlam)
+    CUDA.CUSPARSE.mv!('N', 1, problem.constraint_matrix,
+                      probe_buffer.hyper_tmp, 0, probe_buffer.hyper_tmp2, 'O',
+                      CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+
+    # 8. Update dual_hyperparam
+    CUDA.@sync @cuda threads=ThreadPerBlock blocks=m_blocks update_dual_hyperparam_kernel!(
+        osgm_state.dual_hyperparam, probe_buffer.aux_dual, probe_buffer.hyper_tmp2,
+        osgm_state.z_start_dual, osgm_state.block_endpoint_dual,
+        tau_p_tau_d, phi_prod, osgm_stepsize, m)
+
+    # 9. Update primal_hyperparam
+    CUDA.@sync @cuda threads=ThreadPerBlock blocks=n_blocks update_primal_hyperparam_kernel!(
+        osgm_state.primal_hyperparam, probe_buffer.hyper_tmp,
+        osgm_state.z_start_primal, osgm_state.block_endpoint_primal,
+        dual_step_size, phi_prod, osgm_stepsize, n)
+end
