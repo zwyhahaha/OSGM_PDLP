@@ -2,67 +2,68 @@
 
 ## Summary
 
-Replace the constant-stepsize inner PDHG in `osgm_pdhg.jl` with an adaptive (backtracking) stepsize, fix the M-norm to use a stable reference stepsize, and simplify the null-step rule by absorbing it into the existing restart scheme.
+Replace the fixed-block-size outer OSGM loop with an event-driven design: run adaptive PDHG steps continuously, and trigger the OSGM boundary update (z_cand, hypergradient) only when the adaptive restart scheme fires. Fix the M-norm to use a stable reference stepsize.
 
 ## Motivation
 
-The current OSGM implementation uses a constant stepsize (from the power method) for inner PDHG steps. This is overly conservative. The adaptive stepsize used in plain PDHG grows when iterations are easy and shrinks when they are not, leading to faster convergence. Additionally, the M-norm null-step rule (comparing `phi_trial` vs `phi_last`) is a weak proxy for solution quality; the restart scheme's KKT-residual comparison is strictly better and already available.
+The current OSGM implementation uses a fixed block size `m` and a constant stepsize for inner PDHG steps. Both are suboptimal: adaptive stepsize grows when iterations are easy and shrinks when they are not; tying OSGM updates to adaptive restarts means the block size is determined by actual convergence progress rather than a hand-tuned parameter. The M-norm null-step rule (comparing `phi_trial` vs `phi_last`) is a weak proxy; the restart scheme's KKT comparison is strictly better and already available at zero extra cost.
 
-## Design Decisions
+## Design
 
-### 1. Reference stepsize for M-norm (`ref_step_size`)
+### Main loop structure
 
-The M-norm `‖r‖_M` with `M = diag(1/τ_p, 1/τ_d)` requires a fixed `τ` to be meaningful across blocks. We use the power-method result `ref_step_size = (1 - ε) / σ_max(A)` (already computed at initialization) as the permanent M-norm reference. This is independent of the adaptive `solver_state.step_size` which evolves during inner steps.
+The outer OSGM loop (fixed `m` steps per outer iteration) is replaced by the plain adaptive PDHG step loop — one step per iteration, identical in structure to `primal_dual_hybrid_gradient_gpu.jl`. The OSGM boundary update fires only when the adaptive restart scheme decides to restart.
 
-`ref_step_size` is stored in `OsgmPdhgParameters`. `solver_state.step_size` is initialized to `ref_step_size` but drifts freely during adaptive inner steps.
+### Adaptive inner stepsize
 
-### 2. Adaptive inner stepsize
+Each PDHG step uses the interaction/movement backtracking loop from `take_step!(AdaptiveStepsizeParams, ...)`, but calling `compute_next_primal_osgm!` / `compute_next_dual_osgm!` instead of the plain kernels. `solver_state.step_size` updates after each step.
 
-Each inner PDHG step uses the same interaction/movement backtracking loop as `take_step!(AdaptiveStepsizeParams, ...)` in `primal_dual_hybrid_gradient_gpu.jl`, but calling `compute_next_primal_osgm!` / `compute_next_dual_osgm!` instead of the plain kernels. `solver_state.step_size` is updated after each inner step.
+### Reference stepsize for M-norm (`ref_step_size`)
 
-### 3. Block size tied to restart frequency
+The M-norm `‖r‖_M` requires a fixed `τ` to be stable across restarts. We use the power-method result `ref_step_size = (1 - ε) / σ_max(A)` computed at initialization as the permanent M-norm reference. `solver_state.step_size` is initialized to `ref_step_size` but drifts freely during adaptive steps. `ref_step_size` is stored in `OsgmPdhgParameters`.
 
-`osgm_block_size` is removed from `OsgmPdhgParameters`. The number of inner steps per outer iteration `m` is read from `params.restart_params.restart_frequency_if_fixed`. This makes the outer OSGM iteration coincide exactly with the restart evaluation point.
+### OSGM update on restart
 
-### 4. Null-step replaced by restart scheme
+`z_start_primal/dual` in `CuOsgmState` records the iterate at the last restart point. When the adaptive restart scheme fires:
 
-The old null-step (compare M-norm `phi_trial` vs `phi_last`) is removed entirely. Instead:
+1. Compute block residual `R^k = z_start - current`
+2. Compute `z_cand = z_start - P_k ⊙ R^k`; write into `current_primal/dual_solution`; `recompute_a_products!`
+3. Call `run_restart_scheme` — computes KKT for z_cand ("current") and weighted average, picks the better point, resets accumulator, updates primal weight. No changes to `run_restart_scheme`.
+4. Probe at accepted point with `ref_step_size` → `phi_next`
+5. Update hypergradient using `phi_last × phi_next`
+6. Save `phi_next → phi_last`; save accepted point → `z_start`
 
-1. After `m` inner steps, compute `z_cand = z^k - P_k ⊙ R^k` and write it into `current_primal/dual_solution`.
-2. Call `run_restart_scheme` — it computes KKT for `z_cand` (now "current") and the weighted average, picks the better point, resets the accumulator if restarting, and updates primal weight.
-3. The accepted point (z_cand or weighted average) becomes the new iterate.
+If the restart scheme does not restart, no OSGM update occurs and `z_start` is not changed.
 
-No changes to `run_restart_scheme`. No extra KKT cost relative to the existing restart scheme.
+### `phi_last` role
 
-### 5. Probe step uses `ref_step_size`
+`phi_last` is kept in `CuOsgmState` but its meaning changes: it is the M-norm at the last restart point (not the last block start). It is initialized to `Inf` so the hypergradient guard (`phi_prod < 1e-30`) suppresses the first update until two restart points exist.
 
-`run_probe_step!` computes the single-step residual `r^k = z^k - T(z^k)` needed for the hypergradient. It uses `ref_step_size` (not `solver_state.step_size`) so the M-norm is stable.
+### `run_probe_step!` and `update_osgm_preconditioner!`
 
-### 6. Hypergradient uses `ref_step_size`
-
-`update_osgm_preconditioner!` derives `primal_step_size = ref_step_size / primal_weight` and `dual_step_size = ref_step_size * primal_weight`. These replace the current lines that use `solver_state.step_size`. `phi_cur` is computed by probing at `z^k` before the inner steps; `phi_next` is computed by probing at the accepted point after the restart scheme.
+Both use `ref_step_size` instead of `solver_state.step_size`, so the M-norm and Jacobian approximation remain stable regardless of adaptive step drift.
 
 ## Changes
 
 | Location | Change |
 |---|---|
 | `OsgmPdhgParameters` | Remove `osgm_block_size`; add `ref_step_size::Float64` |
-| `CuOsgmState` | Remove `phi_last::Float64` |
-| `initialize_osgm_state` | Remove `phi_last` initialization |
-| `optimize` (OSGM) | Keep power method; store result as `ref_step_size` in params; derive `m` from `params.restart_params.restart_frequency_if_fixed`; init `solver_state.step_size = ref_step_size` |
-| `take_osgm_inner_step!` | Add interaction/movement backtracking loop; update `solver_state.step_size` per inner step |
-| `run_probe_step!` | Accept `ref_step_size::Float64` argument; use it instead of `solver_state.step_size` |
-| `update_osgm_preconditioner!` | Accept `ref_step_size::Float64` argument; use it for `primal_step_size` / `dual_step_size` |
-| `osgm_boundary_step!` | Remove phi null-step; probe at z^k for `phi_cur`; compute z_cand → set current → call `run_restart_scheme` → probe at accepted point for `phi_next` → update hypergradient |
-| `take_step!` (OSGM outer) | Pass `ref_step_size` through to `run_probe_step!` and `update_osgm_preconditioner!` |
+| `CuOsgmState` | Remove `block_endpoint_primal/dual`; keep `z_start_primal/dual`, `phi_last`, `primal_hyperparam`, `dual_hyperparam` |
+| `initialize_osgm_state` | Remove `block_endpoint` initialization |
+| `optimize` (OSGM) | Keep power method; store result as `ref_step_size`; replace outer OSGM loop with plain per-step loop; on restart trigger, call OSGM boundary update |
+| `take_osgm_inner_step!` | Add interaction/movement backtracking loop; update `solver_state.step_size` per step |
+| `run_probe_step!` | Accept `ref_step_size::Float64`; use it instead of `solver_state.step_size` |
+| `update_osgm_preconditioner!` | Accept `ref_step_size::Float64`; use it for `primal_step_size` / `dual_step_size` |
+| `osgm_boundary_step!` | Called only on restart; compute z_cand from z_start and current; set current = z_cand; call `run_restart_scheme`; probe phi_next; update hypergradient; save phi_last and z_start |
+| `take_step!` (OSGM outer) | Removed — replaced by per-step loop in `optimize` |
 
 ## Removed
 
-- `phi_last` field and all references
 - `osgm_block_size` field and all references (including CLI flag `--osgm_block_size`)
+- `block_endpoint_primal/dual` from `CuOsgmState`
+- Fixed outer OSGM loop (`take_step!` for OSGM)
 - M-norm null-step comparison (`phi_trial <= osgm_state.phi_last`)
-- Power-method initialization of `solver_state.step_size` as constant — now it is an adaptive starting point
 
 ## Sanity Check
 
-The existing sanity check (`osgm_stepsize = 0.0`) must still pass: with `osgm_stepsize = 0.0` and preconditioner = I, `z_cand = T^m(z^k)`. The restart scheme then picks between `T^m(z^k)` and the weighted average — the same choice plain PDHG makes at each restart. This is not identical to plain PDHG anymore (plain PDHG has restart frequency driven by KKT adaptively), so the sanity check should be updated to compare against a fixed-frequency PDHG run with the same `restart_frequency_if_fixed`.
+With `osgm_stepsize = 0.0` and preconditioner = I, `z_cand = z_start - R^k = current` (since `P_k = I` and `z_cand = z_start - (z_start - current) = current`). The restart scheme then picks between current and weighted average exactly as plain PDHG does. So `osgm_stepsize = 0.0` recovers plain adaptive PDHG with the same restart scheme — the existing sanity check in `test/osgm_sanity_check.jl` should verify this.
