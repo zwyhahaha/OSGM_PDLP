@@ -195,3 +195,97 @@ function take_osgm_inner_step!(
     solver_state.cumulative_kkt_passes += 1
     update_solution_in_solver_state!(problem, solver_state, buffer_state)
 end
+
+# ── Task 3: M-norm, z_cand, and Probe Step ──────────────────────────────────
+
+function compute_m_norm(
+    delta_primal::CuVector{Float64},
+    delta_dual::CuVector{Float64},
+    delta_primal_product::CuVector{Float64},
+    primal_step_size::Float64,
+    dual_step_size::Float64,
+)
+    norm_sq = CUDA.norm(delta_primal)^2 / primal_step_size +
+              2.0 * CUDA.dot(delta_dual, delta_primal_product) +
+              CUDA.norm(delta_dual)^2 / dual_step_size
+    return sqrt(max(norm_sq, 0.0))
+end
+
+function compute_z_cand_kernel!(
+    out::CuDeviceVector{Float64},
+    z_start::CuDeviceVector{Float64},
+    block_endpoint::CuDeviceVector{Float64},
+    hyperparam::CuDeviceVector{Float64},
+    n::Int64,
+)
+    tx = threadIdx().x + (blockDim().x * (blockIdx().x - 0x1))
+    if tx <= n
+        @inbounds begin
+            R = z_start[tx] - block_endpoint[tx]
+            out[tx] = z_start[tx] - hyperparam[tx] * R
+        end
+    end
+    return
+end
+
+function compute_z_cand!(
+    out::CuVector{Float64},
+    z_start::CuVector{Float64},
+    block_endpoint::CuVector{Float64},
+    hyperparam::CuVector{Float64},
+)
+    n = length(out)
+    num_blocks = ceil(Int64, n / ThreadPerBlock)
+    CUDA.@sync @cuda threads=ThreadPerBlock blocks=num_blocks compute_z_cand_kernel!(
+        out, z_start, block_endpoint, hyperparam, n
+    )
+end
+
+function recompute_a_products!(
+    problem::CuLinearProgrammingProblem,
+    solver_state::CuPdhgSolverState,
+)
+    CUDA.CUSPARSE.mv!('N', 1, problem.constraint_matrix,
+                      solver_state.current_primal_solution, 0,
+                      solver_state.current_primal_product, 'O',
+                      CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+    CUDA.CUSPARSE.mv!('N', 1, problem.constraint_matrix_t,
+                      solver_state.current_dual_solution, 0,
+                      solver_state.current_dual_product, 'O',
+                      CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+end
+
+function run_probe_step!(
+    problem::CuLinearProgrammingProblem,
+    solver_state::CuPdhgSolverState,
+    probe_buffer::CuProbeBuffer,
+)
+    step_size = solver_state.step_size
+    primal_weight = solver_state.primal_weight
+
+    compute_next_primal_osgm!(
+        problem,
+        solver_state.current_primal_solution,
+        solver_state.current_dual_product,
+        step_size,
+        primal_weight,
+        probe_buffer.delta_primal,
+        probe_buffer.delta_primal_product,
+        probe_buffer.ones_primal,
+    )
+    compute_next_dual_osgm!(
+        problem,
+        solver_state.current_dual_solution,
+        step_size,
+        primal_weight,
+        probe_buffer.delta_primal_product,
+        solver_state.current_primal_product,
+        probe_buffer.delta_dual,
+        probe_buffer.ones_dual,
+    )
+    # A^T * delta_dual — needed for hypergradient mx computation
+    CUDA.CUSPARSE.mv!('N', 1, problem.constraint_matrix_t,
+                      probe_buffer.delta_dual, 0,
+                      probe_buffer.delta_dual_product, 'O',
+                      CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+end
