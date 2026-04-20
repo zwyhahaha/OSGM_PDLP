@@ -11,7 +11,7 @@ A one-time step is required to set up the necessary packages on the local machin
 ```shell
 $ julia --project -e 'import Pkg; Pkg.instantiate()'
 ```
-
+CUDA_VISIBLE_DEVICES=3 julia --project scripts/sweep_osgm.jl --instance_path data/netlib/adlittle.mps.gz --output_csv results/osgm_sweep.csv --tolerance 1e-4 --osgm_block_size 64 
 ## Use with JuMP
 
 To use cuPDLP with JuMP, use `cuPDLP.Optimizer`:
@@ -27,8 +27,20 @@ model = Model(cuPDLP.Optimizer)
 
 ```shell
 $ julia --project scripts/solve.jl \
---instance_path=INSTANCE_PATH --output_directory=OUTPUT_DIRECTORY \
---tolerance=TOLERANCE --time_sec_limit=TIME_SEC_LIMIT
+--instance_path=data/netlib/afiro.mps.gz \ --output_directory=results/netlib \
+--tolerance=1e-4 --time_sec_limit=30
+```
+
+### Running a dataset folder
+
+Use `solve_dataset.jl` to solve every supported instance in a dataset directory (e.g. a folder of Netlib `.mps.gz` files). Outputs mirror the dataset's subdirectories under `--output_directory`.
+
+```shell
+$ julia --project scripts/solve_dataset.jl \
+--dataset_directory=data/netlib --output_directory=results/netlib \
+--tolerance=1e-4 --time_sec_limit=30
+
+--skip_existing
 ```
 
 ## Interpreting the output

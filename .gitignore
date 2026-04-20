@@ -2,3 +2,15 @@ data/
 asset/
 results/
 .worktrees/
+.codex
+docs/
+.agents/
+.claude/    
+test/
+OSGM_PDLP.md
+run.sh
+skills-lock.json
+CLAUDE.md
+LocalPreferences.toml
+scripts/sweep_osgm.jl
+src/osgm_pdhg_scalar.jl

@@ -4,6 +4,10 @@ import JSON3
 
 import cuPDLP
 
+function instance_name_from_path(instance_path::String)
+    return replace(basename(instance_path), r"\.(mps|MPS|qps|QPS)(\.gz)?$" => "")
+end
+
 function write_vector_to_file(filename, vector)
     open(filename, "w") do io
       for x in vector
@@ -14,6 +18,7 @@ end
 
 function solve_instance_and_output(
     parameters::cuPDLP.PdhgParameters,
+    osgm_params::cuPDLP.OsgmPdhgParameters,
     output_dir::String,
     instance_path::String,
 )
@@ -21,7 +26,7 @@ function solve_instance_and_output(
         mkpath(output_dir)
     end
   
-    instance_name = replace(basename(instance_path), r"\.(mps|MPS|qps|QPS)(\.gz)?$" => "")
+    instance_name = instance_name_from_path(instance_path)
   
     function inner_solve()
         lower_file_name = lowercase(basename(instance_path))
@@ -41,7 +46,8 @@ function solve_instance_and_output(
             println("Instance: ", instance_name)
         end
 
-        output::cuPDLP.SaddlePointOutput = cuPDLP.optimize(parameters, lp)
+        output::cuPDLP.SaddlePointOutput = cuPDLP.optimize(parameters, osgm_params, lp)
+        # output::cuPDLP.SaddlePointOutput = cuPDLP.optimize(parameters, lp)
     
         log = cuPDLP.SolveLog()
         log.instance_name = instance_name
@@ -140,6 +146,20 @@ function parse_command_line()
         help = "Time limit."
         arg_type = Float64
         default = 3600.0
+
+        "--osgm_stepsize"
+        help = "OSGM hypergradient stepsize η (0.0 makes OSGM a no-op and uses plain PDHG)."
+        arg_type = Float64
+        default = 0.0
+
+        "--osgm_block_size"
+        help = "OSGM block size m (number of inner PDHG steps per outer OSGM step)."
+        arg_type = Int
+        default = 10
+
+        "--use_null_step"
+        help = "If set, accept z_osgm only when ||r(z_osgm)||_M <= ||r(z_blk)||_M (spec §10 safeguard)."
+        action = :store_true
     end
 
     return ArgParse.parse_args(arg_parse)
@@ -152,6 +172,9 @@ function main()
     tolerance = parsed_args["tolerance"]
     time_sec_limit = parsed_args["time_sec_limit"]
     output_directory = parsed_args["output_directory"]
+    osgm_stepsize = parsed_args["osgm_stepsize"]
+    osgm_block_size = parsed_args["osgm_block_size"]
+    use_null_step = parsed_args["use_null_step"]
 
     lp = cuPDLP.qps_reader_to_standard_form(instance_path)
 
@@ -197,10 +220,13 @@ function main()
 
     solve_instance_and_output(
         params,
+        cuPDLP.OsgmPdhgParameters(osgm_stepsize, osgm_block_size, use_null_step),
         output_directory,
         instance_path,
     )
 
 end
 
-main()
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end
