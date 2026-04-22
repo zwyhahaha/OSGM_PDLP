@@ -160,6 +160,10 @@ function parse_command_line()
         "--use_null_step"
         help = "If set, accept z_osgm only when ||r(z_osgm)||_M <= ||r(z_blk)||_M (spec §10 safeguard)."
         action = :store_true
+
+        "--skip_warmup"
+        help = "Skip the warm-up solve once the package cache is already primed."
+        action = :store_true
     end
 
     return ArgParse.parse_args(arg_parse)
@@ -175,13 +179,16 @@ function main()
     osgm_stepsize = parsed_args["osgm_stepsize"]
     osgm_block_size = parsed_args["osgm_block_size"]
     use_null_step = parsed_args["use_null_step"]
+    skip_warmup = parsed_args["skip_warmup"]
 
     lp = cuPDLP.qps_reader_to_standard_form(instance_path)
 
-    oldstd = stdout
-    redirect_stdout(devnull)
-    warm_up(lp);
-    redirect_stdout(oldstd)
+    if !skip_warmup
+        oldstd = stdout
+        redirect_stdout(devnull)
+        warm_up(lp)
+        redirect_stdout(oldstd)
+    end
 
     restart_params = cuPDLP.construct_restart_parameters(
         cuPDLP.ADAPTIVE_KKT,    # NO_RESTARTS FIXED_FREQUENCY ADAPTIVE_KKT

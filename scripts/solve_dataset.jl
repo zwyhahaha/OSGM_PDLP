@@ -95,7 +95,11 @@ function parse_command_line()
         "--osgm_block_size"
         help = "OSGM block size m (number of inner PDHG steps per outer OSGM step)."
         arg_type = Int
-        default = 64
+        default = 10
+
+        "--use_null_step"
+        help = "If set, accept z_osgm only when ||r(z_osgm)||_M <= ||r(z_blk)||_M (spec §10 safeguard)."
+        action = :store_true
 
         "--skip_existing"
         help = "Skip instances whose *_summary.json already exists."
@@ -198,6 +202,7 @@ function main()
     time_sec_limit = parsed_args["time_sec_limit"]
     osgm_stepsize = parsed_args["osgm_stepsize"]
     osgm_block_size = parsed_args["osgm_block_size"]
+    use_null_step = parsed_args["use_null_step"]
 
     skip_existing = parsed_args["skip_existing"]
     dry_run = parsed_args["dry_run"]
@@ -244,7 +249,7 @@ function main()
     end
 
     params = build_solver_params(tolerance, time_sec_limit)
-    osgm_params = cuPDLP.OsgmPdhgParameters(osgm_stepsize, osgm_block_size)
+    osgm_params = cuPDLP.OsgmPdhgParameters(osgm_stepsize, osgm_block_size, use_null_step)
 
     start_time = time()
     solved_count = 0

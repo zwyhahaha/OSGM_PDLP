@@ -9,8 +9,12 @@ docs/
 test/
 OSGM_PDLP.md
 run.sh
+run2.sh
 skills-lock.json
 CLAUDE.md
 LocalPreferences.toml
 scripts/sweep_osgm.jl
 src/osgm_pdhg_scalar.jl
+src/precompile.jl
+scripts/solve_no_restart.jl
+__pycache__/

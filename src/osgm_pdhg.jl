@@ -737,13 +737,6 @@ function osgm_update!(
 )
     # OSGM block-end hook. Runs every m accepted PDHG steps.
 
-    # Sanity mode: reduce exactly to vanilla PDHG when OSGM is disabled
-    # and null-step is not used.
-    if iszero(osgm_stepsize) && !use_null_step
-        sync_osgm_block_start!(solver_state, osgm_solver_state)
-        return
-    end
-
     snap_tol = 32 * eps(Float64)
 
     # s = z_blk - z_end  (block displacement)
@@ -770,12 +763,19 @@ function osgm_update!(
         snap_tol,
     )
 
+    # Update A^T y_cand incrementally from A^T y_cur to avoid a full recomputation.
+    osgm_solver_state.tmp_dual .=
+        osgm_solver_state.candidate_dual_solution .-
+        solver_state.current_dual_solution
     osgm_dual_matvec!(
         problem,
-        osgm_solver_state.candidate_dual_solution,
-        osgm_solver_state.candidate_dual_product,  # A^T y_cand
+        osgm_solver_state.tmp_dual,
+        osgm_solver_state.tmp_primal,  # A^T (y_cand - y_cur)
         solver_state,
     )
+    # Reconstruct A^T y_cand from the current product plus the delta product.
+    osgm_solver_state.candidate_dual_product .=
+        solver_state.current_dual_product .+ osgm_solver_state.tmp_primal
 
     # d = ||r(z_blk)||_M^2  (denominator for OGD update)
     reference_pdhg_residual!(
@@ -840,16 +840,14 @@ function osgm_update!(
             step_scale .* (
                 osgm_solver_state.gradient_primal .* osgm_solver_state.delta_block_primal
             ),
-            1.0e-10,
-            10.0,
+            1.e-10, 10.,
         )
         osgm_solver_state.dual_preconditioner .= clamp.(
             osgm_solver_state.dual_preconditioner .+
             step_scale .* (
                 osgm_solver_state.gradient_dual .* osgm_solver_state.delta_block_dual
             ),
-            1.0e-10,
-            10.0,
+            1.e-10, 10.,
         )
     end
 
@@ -860,21 +858,29 @@ function osgm_update!(
     tol = atol + rtol * max(block_residual_norm_sq, candidate_residual_norm_sq)
 
     if !use_null_step || candidate_residual_norm_sq <= block_residual_norm_sq + tol
-        solver_state.current_primal_solution .=
-            osgm_solver_state.candidate_primal_solution
-        solver_state.current_dual_solution .=
-            osgm_solver_state.candidate_dual_solution
-
+        # Update A x_cand incrementally from A x_cur to avoid a full recomputation.
+        osgm_solver_state.tmp_primal .=
+            osgm_solver_state.candidate_primal_solution .-
+            solver_state.current_primal_solution
         osgm_primal_matvec!(
             problem,
-            solver_state.current_primal_solution,
-            osgm_solver_state.candidate_primal_product,  # A x_cand
+            osgm_solver_state.tmp_primal,
+            osgm_solver_state.tmp_dual,  # A (x_cand - x_cur)
             solver_state,
         )
+        # Reconstruct A x_cand from the current product plus the delta product.
+        osgm_solver_state.candidate_primal_product .=
+            solver_state.current_primal_product .+ osgm_solver_state.tmp_dual
+
         solver_state.current_primal_product .=
             osgm_solver_state.candidate_primal_product
         solver_state.current_dual_product .=
             osgm_solver_state.candidate_dual_product
+        
+        solver_state.current_primal_solution .=
+            osgm_solver_state.candidate_primal_solution
+        solver_state.current_dual_solution .=
+            osgm_solver_state.candidate_dual_solution
     end
     # else: rejected null-step, keep z_end unchanged
 
@@ -947,7 +953,6 @@ function optimize(
     d_scaled_problem = scaledqp_cpu_to_gpu(scaled_problem)
     d_problem = d_scaled_problem.scaled_qp
     buffer_lp = qp_cpu_to_gpu(original_problem)
-
 
     # initialization
     solver_state = CuPdhgSolverState(

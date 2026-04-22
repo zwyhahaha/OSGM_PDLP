@@ -9,8 +9,13 @@ Part of the code utilizes https://github.com/google-research/FirstOrderLp.jl whi
 A one-time step is required to set up the necessary packages on the local machine:
 
 ```shell
-$ julia --project -e 'import Pkg; Pkg.instantiate()'
+$ julia --project -e 'import Pkg; Pkg.instantiate(); Pkg.precompile()'
 ```
+
+To reuse that precompile cache across runs, keep `JULIA_DEPOT_PATH` on a
+persistent directory. If you point it at a temporary location such as `/tmp`,
+Julia may need to precompile `cuPDLP` again on later runs.
+
 CUDA_VISIBLE_DEVICES=3 julia --project scripts/sweep_osgm.jl --instance_path data/netlib/adlittle.mps.gz --output_csv results/osgm_sweep.csv --tolerance 1e-4 --osgm_block_size 64 
 ## Use with JuMP
 
@@ -29,6 +34,14 @@ model = Model(cuPDLP.Optimizer)
 $ julia --project scripts/solve.jl \
 --instance_path=data/netlib/afiro.mps.gz \ --output_directory=results/netlib \
 --tolerance=1e-4 --time_sec_limit=30
+```
+
+After the first warm-up run, you can skip the extra warm-up solve:
+
+```shell
+$ julia --project scripts/solve.jl \
+--instance_path=data/netlib/afiro.mps.gz --output_directory=results/netlib \
+--tolerance=1e-4 --time_sec_limit=30 --skip_warmup
 ```
 
 ### Running a dataset folder
